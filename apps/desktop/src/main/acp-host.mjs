@@ -692,7 +692,6 @@ export function createAcpHostRuntime(options = {}) {
   const rmImpl = options.rm ?? rm;
   const version = options.clientVersion ?? clientVersion();
   const handshakeTimeoutMs = options.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS;
-  const authenticationTimeoutMs = options.authenticationTimeoutMs ?? 5 * 60_000;
   const commandDeps = options;
   const manager = options.adapterManager ?? (options.adapterStore ? createAcpAdapterManager({ root: options.adapterStore, executablePath: options.executablePath }) : null);
   const active = new Map();
@@ -726,7 +725,6 @@ export function createAcpHostRuntime(options = {}) {
     const cwd = await createAcpWorkspace(mkdtempImpl, options.tmpRoot);
     let child = null;
     let authMethods = [];
-    let authenticationPending = false;
     const abort = () => stopChild(child);
     signal?.addEventListener("abort", abort, { once: true });
     try {
@@ -740,9 +738,7 @@ export function createAcpHostRuntime(options = {}) {
       authMethods = publicAuthMethods(initialized);
       if (authMethodId) {
         if (!authMethods.some((method) => method.id === authMethodId)) throw new Error("invalid_auth_method");
-        authenticationPending = true;
         await connection.authenticate({ methodId: authMethodId });
-        authenticationPending = false;
       }
       const session = await connection.newSession({ cwd, mcpServers });
       if (signal?.aborted) throw Object.assign(new Error("connection_timeout"), { code: "TIMEOUT" });
@@ -757,7 +753,6 @@ export function createAcpHostRuntime(options = {}) {
       };
     } catch (error) {
       if (authMethods.length && error && typeof error === "object") error.authMethods = authMethods;
-      if (authenticationPending && error && typeof error === "object") error.authenticationPending = true;
       abort();
       await removeAcpWorkspace(cwd, rmImpl);
       throw error;
@@ -774,7 +769,7 @@ export function createAcpHostRuntime(options = {}) {
       return await operation(controller.signal);
     } catch (error) {
       if (controller.signal.aborted && !isAuthRequiredError(error) && error?.code !== "ENOENT") {
-        throw Object.assign(new Error("connection_timeout"), { code: "TIMEOUT", authMethods: error?.authMethods, authenticationPending: error?.authenticationPending });
+        throw Object.assign(new Error("connection_timeout"), { code: "TIMEOUT" });
       }
       throw error;
     } finally {
@@ -892,20 +887,12 @@ export function createAcpHostRuntime(options = {}) {
       if (!resolved.ok) return adapterFromResolution(id, resolved);
       let connected;
       try {
-        connected = await withHandshakeTimeout((signal) => connect(resolved.command, `auth-${id}`, () => {}, signal, input.methodId), authenticationTimeoutMs);
+        connected = await withHandshakeTimeout((signal) => connect(resolved.command, `auth-${id}`, () => {}, signal, input.methodId), 5 * 60_000);
         const adapter = { ...adapterShell(id), state: "available", promptCapabilities: connected.promptCapabilities, authMethods: connected.authMethods, ...(resolved.version ? { version: resolved.version, managed: true } : {}) };
         latestStatus.set(id, adapter);
         return adapter;
       } catch (error) {
-        const timedOut = error?.code === "TIMEOUT" && error?.authenticationPending;
-        const adapter = {
-          ...adapterShell(id),
-          ...(timedOut ? { state: "needs_login", detail: "authentication_timeout" } : failureFields(classifyAcpFailure(error))),
-          ...((timedOut || isAuthRequiredError(error)) ? { authMethods: error.authMethods ?? latestStatus.get(id)?.authMethods ?? [] } : {}),
-          ...(resolved.version ? { version: resolved.version, managed: true } : {}),
-        };
-        latestStatus.set(id, adapter);
-        return adapter;
+        return { ...adapterShell(id), ...failureFields(classifyAcpFailure(error)), ...(isAuthRequiredError(error) ? { authMethods: error.authMethods ?? [] } : {}), ...(resolved.version ? { version: resolved.version, managed: true } : {}) };
       } finally {
         if (connected) {
           connected.stop();
@@ -925,12 +912,6 @@ export function createAcpHostRuntime(options = {}) {
       };
       const resolved = resolveCommand({ id: input.adapterId, path: input.path });
       if (!resolved.ok) return fail(promptFailureMessage(resolved));
-      const customPath = input.adapterId === "antigravity" && typeof input.path === "string" ? input.path.trim() : "";
-      const rememberPromptStatus = (fields) => latestStatus.set(input.adapterId, {
-        ...adapterShell(input.adapterId),
-        ...fields,
-        ...(customPath ? { customPath } : {}),
-      });
 
       let connected;
       let mcpBridge;
@@ -940,27 +921,13 @@ export function createAcpHostRuntime(options = {}) {
           const access = await options.mcpAccess();
           mcpBridge = await (options.startMcpBridge ?? startAcpMcpBridge)(access);
         }
-      } catch (error) {
-        return fail(promptFailureMessage(classifyAcpFailure(error)));
-      }
-      try {
         connected = await withHandshakeTimeout((signal) => connect(
           resolved.command, requestId, notify, signal, undefined,
           mcpBridge ? [mcpServerFor(mcpBridge)] : [], true,
         ));
-        rememberPromptStatus({
-          state: "available",
-          authMethods: connected.authMethods,
-          promptCapabilities: connected.promptCapabilities,
-        });
       } catch (error) {
-        const failure = classifyAcpFailure(error);
-        rememberPromptStatus({
-          ...failureFields(failure),
-          ...(failure.state === "needs_login" ? { authMethods: error.authMethods ?? [] } : {}),
-        });
         await mcpBridge?.close();
-        return fail(promptFailureMessage(failure));
+        return fail(promptFailureMessage(classifyAcpFailure(error)));
       }
 
       let content;
@@ -1006,7 +973,7 @@ export function createAcpHostRuntime(options = {}) {
         if (session.cancelled) return finish({ requestId, type: "done" });
         const failure = promptResultFailure(result);
         if (failure === "needs_login") {
-          rememberPromptStatus({ state: "needs_login", authMethods: connected.authMethods });
+          latestStatus.set(input.adapterId, { ...adapterShell(input.adapterId), state: "needs_login", authMethods: connected.authMethods });
         }
         finish(failure ? { requestId, type: "error", message: failure } : { requestId, type: "done" });
       }).catch((error) => {
@@ -1014,7 +981,7 @@ export function createAcpHostRuntime(options = {}) {
         else {
           const failure = classifyAcpFailure(error);
           if (failure.state === "needs_login") {
-            rememberPromptStatus({ state: "needs_login", authMethods: connected.authMethods });
+            latestStatus.set(input.adapterId, { ...adapterShell(input.adapterId), state: "needs_login", authMethods: connected.authMethods });
           }
           finish({ requestId, type: "error", message: promptFailureMessage(failure) });
         }
