@@ -1,0 +1,53 @@
+name: EE Verify
+
+# Temporary deployment verification workflow. Lives only on the ee-verify
+# branch and is removed after the check completes.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe EdgeEver endpoints
+        env:
+          BASE: https://edgeever.xfy196.workers.dev
+          ADMIN_USER: admin
+          ADMIN_PASSWORD: ${{ secrets.EDGE_EVER_AUTH_PASSWORD }}
+        run: |
+          set -u
+          echo "::add-mask::$ADMIN_PASSWORD"
+
+          echo "===== 1) GET /api/health ====="
+          code=$(curl -sS -o /tmp/health.json -w '%{http_code}' --max-time 30 "$BASE/api/health" || echo ERR)
+          echo "HTTP_STATUS=$code"
+          echo "BODY=$(head -c 400 /tmp/health.json)"
+
+          echo "===== 2) GET /api/openapi.json ====="
+          code2=$(curl -sS -o /tmp/openapi.json -w '%{http_code}' --max-time 30 "$BASE/api/openapi.json" || echo ERR)
+          echo "HTTP_STATUS=$code2"
+          jq -c '{ok: .ok, title: .info.title, version: .info.version, path_count: (.paths | length)}' /tmp/openapi.json 2>/dev/null || head -c 300 /tmp/openapi.json
+          echo "LOGIN_PATHS=$(jq -c '[.paths | keys[] | select(test("login"))]' /tmp/openapi.json 2>/dev/null)"
+
+          echo "===== 3) POST /api/v1/auth/login ====="
+          BODY=$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASSWORD" '{username:$u,password:$p}')
+          code3=$(curl -sS -o /tmp/login.json -w '%{http_code}' --max-time 30 \
+            -c /tmp/cookies.txt -X POST "$BASE/api/v1/auth/login" \
+            -H 'Content-Type: application/json' -H "Origin: $BASE" -d "$BODY" || echo ERR)
+          echo "HTTP_STATUS=$code3"
+          jq -c 'if type == "object" then del(.token, .sessionToken, .session, .accessToken) else . end' /tmp/login.json 2>/dev/null | head -c 600
+          echo
+          echo "SESSION_COOKIE_SET=$(grep -c edgeever_session /tmp/cookies.txt || true)"
+
+          echo "===== 4) GET /api/v1/auth/session (带会话 Cookie) ====="
+          code4=$(curl -sS -o /tmp/session.json -w '%{http_code}' --max-time 30 -b /tmp/cookies.txt "$BASE/api/v1/auth/session" || echo ERR)
+          echo "HTTP_STATUS=$code4"
+          jq -c 'if type == "object" then (. | del(.token, .sessionToken, .session)) else . end' /tmp/session.json 2>/dev/null | head -c 600
+          echo
+
+          echo "===== SUMMARY ====="
+          echo "health=$code openapi=$code2 login=$code3 session=$code4"
