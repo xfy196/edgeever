@@ -11,6 +11,7 @@ import { waitForChildProcessSpawn } from "./child-process-start.mjs";
 import { createAcpAdapterManager } from "./acp-adapter-manager.mjs";
 import { startAcpMcpBridge } from "./acp-mcp-bridge.mjs";
 import { withAntigravityMacProxy } from "./antigravity-proxy.mjs";
+import { authenticateWorkBuddy, prepareWorkBuddyAuth } from "./workbuddy-auth.mjs";
 
 const ADAPTERS = {
   codex: { id: "codex", label: "Codex" },
@@ -692,6 +693,7 @@ export function createAcpHostRuntime(options = {}) {
   const rmImpl = options.rm ?? rm;
   const version = options.clientVersion ?? clientVersion();
   const handshakeTimeoutMs = options.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS;
+  const authenticationTimeoutMs = options.authenticationTimeoutMs ?? 5 * 60_000;
   const commandDeps = options;
   const manager = options.adapterManager ?? (options.adapterStore ? createAcpAdapterManager({ root: options.adapterStore, executablePath: options.executablePath }) : null);
   const active = new Map();
@@ -721,10 +723,11 @@ export function createAcpHostRuntime(options = {}) {
     return adapt(resolveAcpCommand(input, commandDeps));
   };
 
-  const connect = async (command, requestId, emit, signal, authMethodId, mcpServers = [], allowPermissions = false) => {
+  const connect = async (command, requestId, emit, signal, authMethodId, mcpServers = [], allowPermissions = false, workBuddyAuth = null, verifyWorkBuddy = false) => {
     const cwd = await createAcpWorkspace(mkdtempImpl, options.tmpRoot);
     let child = null;
     let authMethods = [];
+    let authenticationPending = false;
     const abort = () => stopChild(child);
     signal?.addEventListener("abort", abort, { once: true });
     try {
@@ -736,9 +739,20 @@ export function createAcpHostRuntime(options = {}) {
       void connection.closed?.catch(() => {});
       const initialized = await connection.initialize(acpInitializeParams(version));
       authMethods = publicAuthMethods(initialized);
+      const readCredential = async () => {
+        const result = await connection.extMethod("_codebuddy.ai/getUserInfo", {});
+        const token = result?.userInfo?.accessToken ?? result?.userInfo?.token;
+        // The bundled CLI can restore account metadata without decrypting tokens.
+        if (result?.userInfo && !(typeof token === "string" && token)) throw new Error("workbuddy_credentials_unavailable");
+        return typeof token === "string" && token ? createHash("sha256").update(token).digest("hex") : null;
+      };
+      if (verifyWorkBuddy) await readCredential();
       if (authMethodId) {
         if (!authMethods.some((method) => method.id === authMethodId)) throw new Error("invalid_auth_method");
-        await connection.authenticate({ methodId: authMethodId });
+        authenticationPending = true;
+        if (workBuddyAuth) await authenticateWorkBuddy(workBuddyAuth, authMethodId, signal, { readCredential });
+        else await connection.authenticate({ methodId: authMethodId });
+        authenticationPending = false;
       }
       const session = await connection.newSession({ cwd, mcpServers });
       if (signal?.aborted) throw Object.assign(new Error("connection_timeout"), { code: "TIMEOUT" });
@@ -753,6 +767,7 @@ export function createAcpHostRuntime(options = {}) {
       };
     } catch (error) {
       if (authMethods.length && error && typeof error === "object") error.authMethods = authMethods;
+      if (authenticationPending && error && typeof error === "object") error.authenticationPending = true;
       abort();
       await removeAcpWorkspace(cwd, rmImpl);
       throw error;
@@ -769,7 +784,7 @@ export function createAcpHostRuntime(options = {}) {
       return await operation(controller.signal);
     } catch (error) {
       if (controller.signal.aborted && !isAuthRequiredError(error) && error?.code !== "ENOENT") {
-        throw Object.assign(new Error("connection_timeout"), { code: "TIMEOUT" });
+        throw Object.assign(new Error("connection_timeout"), { code: "TIMEOUT", authMethods: error?.authMethods, authenticationPending: error?.authenticationPending });
       }
       throw error;
     } finally {
@@ -860,7 +875,7 @@ export function createAcpHostRuntime(options = {}) {
       if (!resolved.ok) return adapterFromResolution(id, resolved);
       let connected;
       try {
-        connected = await withHandshakeTimeout((signal) => connect(resolved.command, `probe-${id}`, () => {}, signal));
+        connected = await withHandshakeTimeout((signal) => connect(resolved.command, `probe-${id}`, () => {}, signal, undefined, [], false, null, id === "workbuddyCn" || id === "workbuddyIntl"));
       } catch (error) {
         const failure = { ...adapterShell(id), ...failureFields(classifyAcpFailure(error)), ...(isAuthRequiredError(error) ? { authMethods: error.authMethods ?? [] } : {}), ...(resolved.version ? { version: resolved.version, managed: true } : {}) };
         latestStatus.set(id, failure);
@@ -887,12 +902,30 @@ export function createAcpHostRuntime(options = {}) {
       if (!resolved.ok) return adapterFromResolution(id, resolved);
       let connected;
       try {
-        connected = await withHandshakeTimeout((signal) => connect(resolved.command, `auth-${id}`, () => {}, signal, input.methodId), 5 * 60_000);
+        connected = await withHandshakeTimeout(async (signal) => {
+          const workBuddyAuth = id === "workbuddyCn" || id === "workbuddyIntl" ? await prepareWorkBuddyAuth(resolved.command) : null;
+          return connect(workBuddyAuth?.command ?? resolved.command, `auth-${id}`, () => {}, signal, input.methodId, [], false, workBuddyAuth);
+        }, authenticationTimeoutMs);
+        if (id === "workbuddyCn" || id === "workbuddyIntl") {
+          connected.stop();
+          await removeAcpWorkspace(connected.cwd, rmImpl);
+          connected = null;
+          // Login is useful only if a fresh chat process can restore credentials.
+          connected = await withHandshakeTimeout((signal) => connect(resolved.command, `auth-check-${id}`, () => {}, signal, undefined, [], false, null, true));
+        }
         const adapter = { ...adapterShell(id), state: "available", promptCapabilities: connected.promptCapabilities, authMethods: connected.authMethods, ...(resolved.version ? { version: resolved.version, managed: true } : {}) };
         latestStatus.set(id, adapter);
         return adapter;
       } catch (error) {
-        return { ...adapterShell(id), ...failureFields(classifyAcpFailure(error)), ...(isAuthRequiredError(error) ? { authMethods: error.authMethods ?? [] } : {}), ...(resolved.version ? { version: resolved.version, managed: true } : {}) };
+        const timedOut = error?.code === "TIMEOUT" && error?.authenticationPending;
+        const adapter = {
+          ...adapterShell(id),
+          ...(timedOut ? { state: "needs_login", detail: "authentication_timeout" } : error?.message === "authentication_failed" ? { state: "needs_login", detail: "authentication_failed" } : failureFields(classifyAcpFailure(error))),
+          ...((timedOut || isAuthRequiredError(error)) ? { authMethods: error.authMethods ?? latestStatus.get(id)?.authMethods ?? [] } : {}),
+          ...(resolved.version ? { version: resolved.version, managed: true } : {}),
+        };
+        latestStatus.set(id, adapter);
+        return adapter;
       } finally {
         if (connected) {
           connected.stop();
@@ -912,6 +945,12 @@ export function createAcpHostRuntime(options = {}) {
       };
       const resolved = resolveCommand({ id: input.adapterId, path: input.path });
       if (!resolved.ok) return fail(promptFailureMessage(resolved));
+      const customPath = input.adapterId === "antigravity" && typeof input.path === "string" ? input.path.trim() : "";
+      const rememberPromptStatus = (fields) => latestStatus.set(input.adapterId, {
+        ...adapterShell(input.adapterId),
+        ...fields,
+        ...(customPath ? { customPath } : {}),
+      });
 
       let connected;
       let mcpBridge;
@@ -921,13 +960,27 @@ export function createAcpHostRuntime(options = {}) {
           const access = await options.mcpAccess();
           mcpBridge = await (options.startMcpBridge ?? startAcpMcpBridge)(access);
         }
+      } catch (error) {
+        return fail(promptFailureMessage(classifyAcpFailure(error)));
+      }
+      try {
         connected = await withHandshakeTimeout((signal) => connect(
           resolved.command, requestId, notify, signal, undefined,
-          mcpBridge ? [mcpServerFor(mcpBridge)] : [], true,
+          mcpBridge ? [mcpServerFor(mcpBridge)] : [], true, null, input.adapterId === "workbuddyCn" || input.adapterId === "workbuddyIntl",
         ));
+        rememberPromptStatus({
+          state: "available",
+          authMethods: connected.authMethods,
+          promptCapabilities: connected.promptCapabilities,
+        });
       } catch (error) {
+        const failure = classifyAcpFailure(error);
+        rememberPromptStatus({
+          ...failureFields(failure),
+          ...(failure.state === "needs_login" ? { authMethods: error.authMethods ?? [] } : {}),
+        });
         await mcpBridge?.close();
-        return fail(promptFailureMessage(classifyAcpFailure(error)));
+        return fail(promptFailureMessage(failure));
       }
 
       let content;
@@ -973,7 +1026,7 @@ export function createAcpHostRuntime(options = {}) {
         if (session.cancelled) return finish({ requestId, type: "done" });
         const failure = promptResultFailure(result);
         if (failure === "needs_login") {
-          latestStatus.set(input.adapterId, { ...adapterShell(input.adapterId), state: "needs_login", authMethods: connected.authMethods });
+          rememberPromptStatus({ state: "needs_login", authMethods: connected.authMethods });
         }
         finish(failure ? { requestId, type: "error", message: failure } : { requestId, type: "done" });
       }).catch((error) => {
@@ -981,7 +1034,7 @@ export function createAcpHostRuntime(options = {}) {
         else {
           const failure = classifyAcpFailure(error);
           if (failure.state === "needs_login") {
-            latestStatus.set(input.adapterId, { ...adapterShell(input.adapterId), state: "needs_login", authMethods: connected.authMethods });
+            rememberPromptStatus({ state: "needs_login", authMethods: connected.authMethods });
           }
           finish({ requestId, type: "error", message: promptFailureMessage(failure) });
         }

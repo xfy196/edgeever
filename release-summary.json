@@ -1,17 +1,29 @@
 {
-  "version": "1.105.0",
+  "version": "1.109.0",
   "changes": {
     "en-US": [
-      "AI agents can preview and delete empty notebook trees through MCP, with protection for notebooks containing active notes, the inbox, and concurrent changes (#509).",
-      "Improve the desktop AI agent selector with cached and preloaded connection status, status dots, clearer menus, and reliable agent settings across layouts."
+      "Refresh note image sharing with refined themes, theme-matched typography, monogram avatars, and a streamlined preview.",
+      "Android fullscreen note images now support pinch zoom and dragging to inspect details (#520).",
+      "Make poster editing more reliable by avoiding false save and draft recovery conflicts, improving editor startup, and consolidating zoom controls.",
+      "Keep the AI assistant launcher consistently positioned across note editors.",
+      "Restore the all-notes view when the selected notebook is deleted from another client.",
+      "Improve WorkBuddy login checks so unusable saved credentials are reported instead of appearing connected."
     ],
     "zh-CN": [
-      "AI Agent 可通过 MCP 预览并删除空笔记本树，同时保护含有效笔记的目录、等待分类及并发变更（#509）。",
-      "改进桌面 AI Agent 选择器：缓存并预加载连接状态，显示状态圆点，简化菜单，并修复不同布局下的 Agent 设置和连接判断。"
+      "升级笔记图片分享：精修主题、支持跟随主题的字体、字母头像，并简化预览操作。",
+      "Android 笔记图片全屏后支持双指缩放和拖动，便于查看大图细节（#520）。",
+      "提升海报编辑可靠性：避免误报保存及草稿恢复冲突，改善编辑器启动，并统一缩放操作。",
+      "统一各类笔记编辑器中 AI 助手入口的位置与间距。",
+      "选中的笔记本被其他客户端删除后，自动恢复全部笔记列表。",
+      "改善 WorkBuddy 登录检查，避免不可用的已保存凭据被误显示为连接成功。"
     ],
     "ja": [
-      "MCP で空のノートブック階層をプレビューして削除できるようになりました。ノートを含む階層、受信トレイ、同時変更は保護されます（#509）。",
-      "デスクトップの AI エージェント選択で接続状態をキャッシュして事前に読み込み、状態表示とメニューを改善しました。レイアウト間の設定と接続判定も修正しました。"
+      "ノートの画像共有に洗練されたテーマ、テーマに合わせたフォント、イニシャルアイコン、使いやすいプレビューを追加しました。",
+      "Android の全画面画像でピンチズームとドラッグに対応し、細部を確認しやすくしました（#520）。",
+      "ポスター編集の保存・下書き復元時の誤った競合を修正し、起動とズーム操作を改善しました。",
+      "各ノート編集画面で AI アシスタントの位置と間隔を統一しました。",
+      "選択中のノートブックが別の端末で削除された場合、すべてのノート一覧に戻るよう修正しました。",
+      "WorkBuddy のログイン確認を改善し、使用できない保存済み認証情報を接続成功と表示する問題を修正しました。"
     ]
   }
 }
